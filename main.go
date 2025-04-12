@@ -14,8 +14,10 @@ import (
 	"encoding/json"
 	"strings"
 	"time"
+	"errors"
 
 	"github.com/Rota-of-light/HTTPServer/internal/database"
+	"github.com/Rota-of-light/HTTPServer/internal/auth"
 )
 
 type apiConfig struct {
@@ -89,6 +91,7 @@ func (cfg *apiConfig) adminResetHandler(w http.ResponseWriter, r *http.Request) 
 
 func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) {
 	type parameters struct {
+		Password string `json:"password"`
         Email string `json:"email"`
     }
 	if r.Body == nil {
@@ -103,7 +106,17 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
         respondWithError(w, http.StatusInternalServerError, errorString)
 		return
     }
-	user, err := cfg.db.CreateUser(r.Context(), params.Email)
+	hash, err := auth.HashPassword(params.Password)
+	if err != nil {
+		errorString := "Something went wrong when working with password"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	userParams := database.CreateUserParams{
+		Email:	params.Email,
+		HashedPassword: hash,
+	}
+	user, err := cfg.db.CreateUser(r.Context(), userParams)
 	if err != nil {
 		errorString := "Something went wrong when attempting to create user"
         respondWithError(w, http.StatusInternalServerError, errorString)
@@ -217,6 +230,92 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
     respondWithJSON(w, http.StatusCreated, chirpJSON)
 }
 
+func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	dbChirps, err := cfg.db.AllChirps(r.Context())
+	if err != nil {
+		errorString := "Error when attempting to retrive all chirps"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	chirps := make([]Chirp, len(dbChirps))
+	for i, chirp := range dbChirps {
+		chirps[i] = Chirp{
+			ID:			chirp.ID,
+			CreatedAt:	chirp.CreatedAt,
+			UpdatedAt:	chirp.UpdatedAt,
+			Body:		chirp.Body,
+			UserId:		chirp.UserID,
+		}
+	}
+	respondWithJSON(w, http.StatusOK, chirps)
+}
+
+func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request) {
+	chirpIDStr := r.PathValue("chirpID")
+	chirpID, err := uuid.Parse(chirpIDStr)
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, "Invalid chirp ID format")
+        return
+    }
+	chirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			errorString := "Chirp not found"
+        respondWithError(w, http.StatusNotFound, errorString)
+		return
+		}
+		errorString := "Error when attempting to retrive chirp"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	chirpJSON := Chirp{
+		ID:			chirp.ID,
+		CreatedAt:	chirp.CreatedAt,
+		UpdatedAt:	chirp.UpdatedAt,
+		Body:		chirp.Body,
+		UserId:		chirp.UserID,
+	}
+	respondWithJSON(w, http.StatusOK, chirpJSON)
+}
+
+func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
+	type parameters struct {
+		Password string `json:"password"`
+        Email string `json:"email"`
+    }
+	if r.Body == nil {
+		respondWithError(w, http.StatusBadRequest, "Request body missing")
+		return
+	}
+    decoder := json.NewDecoder(r.Body)
+    params := parameters{}
+    err := decoder.Decode(&params)
+    if err != nil {
+		errorString := "Something went wrong"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	user, err := cfg.db.GetUserByEmail(r.Context(), params.Email)
+	if err != nil {
+		errorString := "Incorrect email or password"
+        respondWithError(w, http.StatusUnauthorized, errorString)
+		return
+    }
+	err = auth.CheckPasswordHash(user.HashedPassword, params.Password)
+	if err != nil {
+		errorString := "Incorrect email or password"
+        respondWithError(w, http.StatusUnauthorized, errorString)
+		return
+    }
+	newUser := User{
+		ID:	user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email: user.Email,
+	}
+	respondWithJSON(w, http.StatusOK, newUser)
+}
+
 func main() {
 	err := godotenv.Load()
     if err != nil {
@@ -238,9 +337,12 @@ func main() {
 	fServer := http.FileServer(dir)
 	server.Handle("/app/", config.middlewareMetricsInc(http.StripPrefix("/app", fServer)))
 	server.HandleFunc("GET /admin/metrics", config.metricCountHandler)
+	server.HandleFunc("GET /api/chirps", config.getChirpsHandler)
+	server.HandleFunc("GET /api/chirps/{chirpID}", config.getChirpByIDHandler)
 	server.HandleFunc("POST /admin/reset", config.adminResetHandler)
 	server.HandleFunc("POST /api/users", config.createUserHandler)
 	server.HandleFunc("POST /api/chirps", config.chirpsHandler)
+	server.HandleFunc("POST /api/login", config.loginHandler)
 	s := &http.Server{
 		Addr:	":8080",
 		Handler: server,
