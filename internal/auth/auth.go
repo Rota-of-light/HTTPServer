@@ -7,6 +7,10 @@ import (
 
 	"time"
 	"fmt"
+	"net/http"
+	"strings"
+	"crypto/rand"
+	"encoding/hex"
 )
 
 func HashPassword(password string) (string, error) {
@@ -54,4 +58,28 @@ func ValidateJWT(tokenString, tokenSecret string) (uuid.UUID, error) {
 		return uuid.Nil, fmt.Errorf("Invalid user ID: %v", err)
 	}
 	return id, nil
+}
+
+func GetBearerToken(headers http.Header) (string, error) {
+	authHeader := headers.Get("Authorization")
+	if authHeader == "" {
+		return "", fmt.Errorf("Error: no authorization in header")
+	}
+	authString := strings.Split(authHeader, " ")
+	if len(authString) < 2 {
+		return "", fmt.Errorf("Error: authorization header format must be: Bearer {TOKEN}")
+	}
+	if authString[0] != "Bearer" {
+		return "", fmt.Errorf("Error: authorization header must start with 'Bearer'")
+	}
+	return authString[1], nil
+}
+
+func MakeRefreshToken() (string, error) {
+	key := make([]byte, 32)
+	rand.Read(key)
+	if _, err := rand.Read(key); err != nil {
+        return "", err
+    }
+	return hex.EncodeToString(key), nil
 }

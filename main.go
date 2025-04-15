@@ -24,6 +24,7 @@ type apiConfig struct {
 	db		*database.Queries
 	fileserverHits atomic.Int32
 	platform	string
+	secret 		string
 }
 
 type User struct {
@@ -31,6 +32,8 @@ type User struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Email     string    `json:"email"`
+	Token	  string	`json:"token"`
+	RefreshToken string `json:"refresh_token"`
 }
 
 type Chirp struct {
@@ -38,7 +41,7 @@ type Chirp struct {
 	CreatedAt time.Time `json:"created_at"`
 	UpdatedAt time.Time `json:"updated_at"`
 	Body     string    `json:"body"`
-	UserId	 uuid.UUID    `json:"user_id"`
+	UserID	 uuid.UUID    `json:"user_id"`
 }
 
 func (cfg *apiConfig) middlewareMetricsInc(next http.Handler) http.Handler {
@@ -182,9 +185,18 @@ func respondWithJSON(w http.ResponseWriter, code int, payload interface{}) {
 }
 
 func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
-    type parameters struct {
+    authString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	userID, err := auth.ValidateJWT(authString, cfg.secret)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	type parameters struct {
         Body string `json:"body"`
-		UserId uuid.UUID `json:"user_id"`
     }
 	if r.Body == nil {
 		respondWithError(w, http.StatusBadRequest, "Request body missing")
@@ -192,16 +204,10 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
 	}
     decoder := json.NewDecoder(r.Body)
     params := parameters{}
-    err := decoder.Decode(&params)
+    err = decoder.Decode(&params)
     if err != nil {
 		errorString := "Something went wrong when decoding request"
         respondWithError(w, http.StatusInternalServerError, errorString)
-		return
-    }
-	user, err := cfg.db.GetUserByID(r.Context(), params.UserId)
-	if len(user.ID) == 0 || err != nil {
-		errorString := "Invalid user ID"
-        respondWithError(w, http.StatusBadRequest, errorString)
 		return
     }
     if len(params.Body) > 140 {
@@ -212,7 +218,7 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
 	cleanedString := profaneChecker(params.Body)
 	chirpParam := database.CreateChirpParams{
 		Body:   cleanedString,
-		UserID: user.ID,
+		UserID: userID,
 	}
 	chirpRes, err := cfg.db.CreateChirp(r.Context(), chirpParam)
 	if err != nil {
@@ -225,7 +231,7 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
 		CreatedAt: chirpRes.CreatedAt,
 		UpdatedAt: chirpRes.UpdatedAt,
 		Body: chirpRes.Body,
-		UserId: chirpRes.UserID,
+		UserID: chirpRes.UserID,
 	}
     respondWithJSON(w, http.StatusCreated, chirpJSON)
 }
@@ -244,7 +250,7 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
 			CreatedAt:	chirp.CreatedAt,
 			UpdatedAt:	chirp.UpdatedAt,
 			Body:		chirp.Body,
-			UserId:		chirp.UserID,
+			UserID:		chirp.UserID,
 		}
 	}
 	respondWithJSON(w, http.StatusOK, chirps)
@@ -261,8 +267,8 @@ func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			errorString := "Chirp not found"
-        respondWithError(w, http.StatusNotFound, errorString)
-		return
+        	respondWithError(w, http.StatusNotFound, errorString)
+			return
 		}
 		errorString := "Error when attempting to retrive chirp"
         respondWithError(w, http.StatusInternalServerError, errorString)
@@ -273,7 +279,7 @@ func (cfg *apiConfig) getChirpByIDHandler(w http.ResponseWriter, r *http.Request
 		CreatedAt:	chirp.CreatedAt,
 		UpdatedAt:	chirp.UpdatedAt,
 		Body:		chirp.Body,
-		UserId:		chirp.UserID,
+		UserID:		chirp.UserID,
 	}
 	respondWithJSON(w, http.StatusOK, chirpJSON)
 }
@@ -292,9 +298,10 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
     err := decoder.Decode(&params)
     if err != nil {
 		errorString := "Something went wrong"
-        respondWithError(w, http.StatusInternalServerError, errorString)
+        respondWithError(w, http.StatusBadRequest, errorString)
 		return
     }
+	
 	user, err := cfg.db.GetUserByEmail(r.Context(), params.Email)
 	if err != nil {
 		errorString := "Incorrect email or password"
@@ -307,13 +314,119 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
         respondWithError(w, http.StatusUnauthorized, errorString)
 		return
     }
+	
+	expiresIn := time.Duration(3600) * time.Second
+	token, err := auth.MakeJWT(user.ID, cfg.secret, expiresIn)
+	if err != nil {
+		errorString := "Failure when attempting to create authentication token"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	refreshString, err := auth.MakeRefreshToken()
+	if err != nil {
+		errorString := "Failure when attempting to create refresh token"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	refreshExpiresIn := time.Now().Add(60 * 24 * time.Hour)
+	refreshParams := database.CreateRefreshTokenParams{
+		Token: refreshString,
+		UserID: user.ID,
+		ExpiresAt: refreshExpiresIn,
+	}
+	refreshToken, err := cfg.db.CreateRefreshToken(r.Context(), refreshParams)
+	if err != nil {
+		errorString := "Failure when attempting to insert refresh token"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+
 	newUser := User{
 		ID:	user.ID,
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
+		Token: token,
+		RefreshToken: refreshToken.Token,
 	}
 	respondWithJSON(w, http.StatusOK, newUser)
+}
+
+func (cfg *apiConfig) refreshHandler(w http.ResponseWriter, r *http.Request) {
+	authString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	refreshToken, err := cfg.db.GetRefreshByToken(r.Context(), authString)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			errorString := "Authentication token not found"
+        	respondWithError(w, http.StatusUnauthorized, errorString)
+			return
+		}
+		errorString := "Failure when attempting to query for authentication token"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	if refreshToken.ExpiresAt.Before(time.Now()) {
+		errorString := "Authentication token expired"
+        respondWithError(w, http.StatusUnauthorized, errorString)
+		return
+	}
+	user, err := cfg.db.GetUserByRefreshToken(r.Context(), refreshToken.Token)
+	if err != nil {
+		errorString := "Failure when attempting to query for user data"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	expiresIn := time.Duration(3600) * time.Second
+	token, err := auth.MakeJWT(user.ID, cfg.secret, expiresIn)
+	if err != nil {
+		errorString := "Failure when attempting to create authentication token"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	type returnToken struct {
+		Token string `json:"token"`
+	}
+	tokenJSON := returnToken{
+		Token: token,
+	}
+	respondWithJSON(w, http.StatusOK, tokenJSON)
+}
+
+func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
+	authString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	revokeStatus, err := cfg.db.CheckRevokeStatus(r.Context(), authString)
+	if err != nil {
+		if err == sql.ErrNoRows {
+			respondWithError(w, http.StatusUnauthorized, "Invalid or non-existent token")
+			return
+		}
+		errorString := "Failed to fetch token status"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	if revokeStatus.Valid {
+		respondWithError(w, http.StatusConflict, "Authentication has already been revoked")
+		return
+	}
+	revokeParams := database.RevokeRefreshParams{
+		UpdatedAt: time.Now(),
+		Token:	   authString,
+	}
+	err = cfg.db.RevokeRefresh(r.Context(), revokeParams)
+	if err != nil {
+		errorString := "Something went wrong when trying to revoke authentication"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 func main() {
@@ -330,6 +443,7 @@ func main() {
 	config := &apiConfig{
 		db: dbQueries,
 		platform: os.Getenv("PLATFORM"),
+		secret:	os.Getenv("JWT_SECRET"),
 	}
 	server := http.NewServeMux()
 	server.HandleFunc("GET /api/healthz", healthCheckHandler)
@@ -343,6 +457,8 @@ func main() {
 	server.HandleFunc("POST /api/users", config.createUserHandler)
 	server.HandleFunc("POST /api/chirps", config.chirpsHandler)
 	server.HandleFunc("POST /api/login", config.loginHandler)
+	server.HandleFunc("POST /api/refresh", config.refreshHandler)
+	server.HandleFunc("POST /api/revoke", config.revokeHandler)
 	s := &http.Server{
 		Addr:	":8080",
 		Handler: server,
