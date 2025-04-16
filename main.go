@@ -429,6 +429,108 @@ func (cfg *apiConfig) revokeHandler(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) updateUserPassHandler(w http.ResponseWriter, r *http.Request) {
+	authString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	userID, err := auth.ValidateJWT(authString, cfg.secret)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+
+	type parameters struct {
+		Password string `json:"password"`
+        Email string `json:"email"`
+    }
+	if r.Body == nil {
+		respondWithError(w, http.StatusBadRequest, "Request body missing")
+		return
+	}
+    decoder := json.NewDecoder(r.Body)
+    params := parameters{}
+    err = decoder.Decode(&params)
+    if err != nil {
+		errorString := "Something went wrong"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+
+	hash, err := auth.HashPassword(params.Password)
+	if err != nil {
+		errorString := "Something went wrong when working with password"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	userParams := database.UpdateUserPassParams{
+		ID:		userID,
+		Email:	params.Email,
+		HashedPassword: hash,
+	}
+	err = cfg.db.UpdateUserPass(r.Context(), userParams)
+	if err != nil {
+		errorString := "Something went wrong when attempting to update user's email and password"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	user, err := cfg.db.GetUserByID(r.Context(), userID)
+	if err != nil {
+		errorString := "Something went wrong when attempting to retrieve user's information"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	newUser := User{
+		ID:	user.ID,
+		CreatedAt: user.CreatedAt,
+		UpdatedAt: user.UpdatedAt,
+		Email: user.Email,
+	}
+	respondWithJSON(w, http.StatusOK, newUser)
+}
+
+func (cfg *apiConfig) deleteChirpsHandler(w http.ResponseWriter, r *http.Request){
+    authString, err := auth.GetBearerToken(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	userID, err := auth.ValidateJWT(authString, cfg.secret)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	chirpIDStr := r.PathValue("chirpID")
+	chirpID, err := uuid.Parse(chirpIDStr)
+    if err != nil {
+        respondWithError(w, http.StatusBadRequest, "Invalid chirp ID format")
+        return
+    }
+	chirp, err := cfg.db.GetChirp(r.Context(), chirpID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			errorString := "Chirp not found"
+        	respondWithError(w, http.StatusNotFound, errorString)
+			return
+		}
+		errorString := "Error when attempting to find chirp"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	if chirp.UserID != userID {
+		respondWithError(w, http.StatusForbidden, "User does not own this chirp")
+		return
+	}
+	err = cfg.db.DeleteChirp(r.Context(), chirpID)
+	if err != nil {
+		errorString := "Error when attempting to delete chirp"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+    w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
 	err := godotenv.Load()
     if err != nil {
@@ -459,6 +561,8 @@ func main() {
 	server.HandleFunc("POST /api/login", config.loginHandler)
 	server.HandleFunc("POST /api/refresh", config.refreshHandler)
 	server.HandleFunc("POST /api/revoke", config.revokeHandler)
+	server.HandleFunc("PUT /api/users", config.updateUserPassHandler)
+	server.HandleFunc("DELETE /api/chirps/{chirpID}", config.deleteChirpsHandler)
 	s := &http.Server{
 		Addr:	":8080",
 		Handler: server,
