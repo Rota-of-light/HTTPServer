@@ -15,6 +15,7 @@ import (
 	"strings"
 	"time"
 	"errors"
+	"sort"
 
 	"github.com/Rota-of-light/HTTPServer/internal/database"
 	"github.com/Rota-of-light/HTTPServer/internal/auth"
@@ -25,6 +26,7 @@ type apiConfig struct {
 	fileserverHits atomic.Int32
 	platform	string
 	secret 		string
+	polka		string
 }
 
 type User struct {
@@ -34,6 +36,7 @@ type User struct {
 	Email     string    `json:"email"`
 	Token	  string	`json:"token"`
 	RefreshToken string `json:"refresh_token"`
+	IsChirpyRed bool	`json:"is_chirpy_red"`
 }
 
 type Chirp struct {
@@ -130,6 +133,7 @@ func (cfg *apiConfig) createUserHandler(w http.ResponseWriter, r *http.Request) 
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
+		IsChirpyRed: user.IsChirpyRed,
 	}
 	respondWithJSON(w, http.StatusCreated, newUser)
 }
@@ -237,6 +241,38 @@ func (cfg *apiConfig) chirpsHandler(w http.ResponseWriter, r *http.Request){
 }
 
 func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
+	authorIDStr := r.URL.Query().Get("author_id")
+	optionalSort := r.URL.Query().Get("sort")
+	if authorIDStr != "" {
+		authorID, err := uuid.Parse(authorIDStr)
+    	if err != nil {
+        	respondWithError(w, http.StatusBadRequest, "Invalid author ID format")
+        	return
+    	}
+		dbChirps, err := cfg.db.GetChirpsByUser(r.Context(), authorID)
+		if err != nil {
+			errorString := "Error when attempting to retrive all of user's chirps"
+			respondWithError(w, http.StatusInternalServerError, errorString)
+			return
+		}
+		chirps := make([]Chirp, len(dbChirps))
+		for i, chirp := range dbChirps {
+			chirps[i] = Chirp{
+				ID:			chirp.ID,
+				CreatedAt:	chirp.CreatedAt,
+				UpdatedAt:	chirp.UpdatedAt,
+				Body:		chirp.Body,
+				UserID:		chirp.UserID,
+			}
+		}
+		if optionalSort == "desc" {
+			sort.Slice(chirps, func(i, j int) bool {
+				return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+			}) 
+		}
+		respondWithJSON(w, http.StatusOK, chirps)
+		return
+	}
 	dbChirps, err := cfg.db.AllChirps(r.Context())
 	if err != nil {
 		errorString := "Error when attempting to retrive all chirps"
@@ -252,6 +288,11 @@ func (cfg *apiConfig) getChirpsHandler(w http.ResponseWriter, r *http.Request) {
 			Body:		chirp.Body,
 			UserID:		chirp.UserID,
 		}
+	}
+	if optionalSort == "desc" {
+		sort.Slice(chirps, func(i, j int) bool {
+			return chirps[i].CreatedAt.After(chirps[j].CreatedAt)
+		}) 
 	}
 	respondWithJSON(w, http.StatusOK, chirps)
 }
@@ -348,6 +389,7 @@ func (cfg *apiConfig) loginHandler(w http.ResponseWriter, r *http.Request) {
 		Email: user.Email,
 		Token: token,
 		RefreshToken: refreshToken.Token,
+		IsChirpyRed: user.IsChirpyRed,
 	}
 	respondWithJSON(w, http.StatusOK, newUser)
 }
@@ -486,6 +528,7 @@ func (cfg *apiConfig) updateUserPassHandler(w http.ResponseWriter, r *http.Reque
 		CreatedAt: user.CreatedAt,
 		UpdatedAt: user.UpdatedAt,
 		Email: user.Email,
+		IsChirpyRed: user.IsChirpyRed,
 	}
 	respondWithJSON(w, http.StatusOK, newUser)
 }
@@ -531,6 +574,58 @@ func (cfg *apiConfig) deleteChirpsHandler(w http.ResponseWriter, r *http.Request
     w.WriteHeader(http.StatusNoContent)
 }
 
+func (cfg *apiConfig) upgradeRedHandler(w http.ResponseWriter, r *http.Request) {
+	authString, err := auth.GetAPIKey(r.Header)
+	if err != nil {
+        respondWithError(w, http.StatusUnauthorized, err.Error())
+		return
+    }
+	if authString != cfg.polka {
+		w.WriteHeader(http.StatusUnauthorized)
+		return
+	}
+	type parameters struct {
+		Event string `json:"event"`
+		Data struct {
+			UserID       uuid.UUID    `json:"user_id"`
+		} `json:"data"`
+    }
+	if r.Body == nil {
+		respondWithError(w, http.StatusBadRequest, "Request body missing")
+		return
+	}
+    decoder := json.NewDecoder(r.Body)
+    params := parameters{}
+    err = decoder.Decode(&params)
+    if err != nil {
+		errorString := "Something went wrong"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	if params.Event != "user.upgraded" {
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	user, err := cfg.db.GetUserByID(r.Context(), params.Data.UserID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			errorString := "User not found"
+        	respondWithError(w, http.StatusNotFound, errorString)
+			return
+		}
+		errorString := "Something went wrong when attempting to retrieve user's information"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+	}
+	err = cfg.db.UpgradeRed(r.Context(), user.ID)
+	if err != nil {
+		errorString := "Something went wrong when trying to upgrade"
+        respondWithError(w, http.StatusInternalServerError, errorString)
+		return
+    }
+	w.WriteHeader(http.StatusNoContent)
+}
+
 func main() {
 	err := godotenv.Load()
     if err != nil {
@@ -546,6 +641,7 @@ func main() {
 		db: dbQueries,
 		platform: os.Getenv("PLATFORM"),
 		secret:	os.Getenv("JWT_SECRET"),
+		polka:	os.Getenv("POLKA_KEY"),
 	}
 	server := http.NewServeMux()
 	server.HandleFunc("GET /api/healthz", healthCheckHandler)
@@ -561,6 +657,7 @@ func main() {
 	server.HandleFunc("POST /api/login", config.loginHandler)
 	server.HandleFunc("POST /api/refresh", config.refreshHandler)
 	server.HandleFunc("POST /api/revoke", config.revokeHandler)
+	server.HandleFunc("POST /api/polka/webhooks", config.upgradeRedHandler)
 	server.HandleFunc("PUT /api/users", config.updateUserPassHandler)
 	server.HandleFunc("DELETE /api/chirps/{chirpID}", config.deleteChirpsHandler)
 	s := &http.Server{
